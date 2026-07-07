@@ -35,6 +35,11 @@ export const config = {
   get secondOpinionThreshold() {
     return num("SECOND_OPINION_THRESHOLD", 0.9);
   },
+  // Judge fail-fast: cap each attempt so a congested Gemma can't stall a
+  // run — on timeout we drop to the deterministic second-opinion tiebreak.
+  get judgeTimeoutMs() {
+    return num("JUDGE_TIMEOUT_MS", 25000);
+  },
   // cosine >= match → duplicate (variant); < review → new canonical;
   // in between → Gemma judge decides.
   get matchThreshold() {
@@ -46,14 +51,110 @@ export const config = {
   get maxUploadFiles() {
     return num("MAX_UPLOAD_FILES", 5);
   },
-  // Videos per /api/sync request — keeps each request's work bounded
-  // (~10s Netlify free-tier timeout) AND under the embedding free tier's
-  // 100 requests/min, which counts each embedded text, not each API call.
+  // Videos per /api/sync request. Each chunk COMMITS before the next, so a
+  // mid-run failure or the daily embedding cap can't wipe the whole run —
+  // you keep every chunk that finished. Small keeps the loss window small.
   get syncBatchSize() {
-    return num("SYNC_BATCH_SIZE", 1);
+    return num("SYNC_BATCH_SIZE", 3);
   },
   // App-level safety net across ALL AI calls (embed/judge/extract) per UTC day.
   get aiDailyLimit() {
     return num("AI_DAILY_LIMIT", 1000);
   },
+  // Fixed section taxonomy (option c): the ONLY headings the master list can
+  // use. Each canonical question is filed under the label whose description
+  // its embedding is closest to — deterministic, no LLM, always consistent.
+  // Order here is the display order. Override via TAXONOMY env (JSON array of
+  // {name, description}); editing it re-files everything on the next sync.
+  get taxonomy(): { name: string; description: string }[] {
+    const raw = process.env.TAXONOMY;
+    if (raw) {
+      try {
+        return JSON.parse(raw);
+      } catch {
+        // fall through to default
+      }
+    }
+    return DEFAULT_TAXONOMY;
+  },
 };
+
+// Descriptions are keyword-rich on purpose — they are embedded and compared
+// against question embeddings, so more surface area = better routing.
+const DEFAULT_TAXONOMY: { name: string; description: string }[] = [
+  {
+    name: "Project",
+    description:
+      "The candidate's own current project: its architecture, tech stack, request flow, responsibilities, optimizations, and real work experience.",
+  },
+  {
+    name: "Coding Questions",
+    description:
+      "Hands-on Java coding problems and the Stream API: streams, map, flatMap, filter, intermediate and terminal operations, lambdas, functional programming, predict the output.",
+  },
+  {
+    name: "Java Core",
+    description:
+      "Core Java language concepts: OOP, classes, objects, interfaces, records, sealed classes, constructors, static, final, exceptions, keywords, Optional, enums, functional interfaces.",
+  },
+  {
+    name: "Collections",
+    description:
+      "Java Collections Framework: List, Set, Map, ArrayList, LinkedList, HashMap, ConcurrentHashMap, HashSet, Comparable, Comparator, and their internal working.",
+  },
+  {
+    name: "Concurrency & Multithreading",
+    description:
+      "Threads and concurrency: multithreading, synchronization, race conditions, ExecutorService, thread pools, atomic classes, locks, volatile, deadlocks.",
+  },
+  {
+    name: "JVM & Memory",
+    description:
+      "JVM internals and memory: heap, stack, JVM memory structure, garbage collection, memory leaks, OutOfMemoryError, class loading.",
+  },
+  {
+    name: "Spring & Spring Boot",
+    description:
+      "Spring and Spring Boot framework: dependency injection, auto-configuration, beans, profiles, annotations, filters, interceptors, request validation, exception handling.",
+  },
+  {
+    name: "Microservices & Architecture",
+    description:
+      "Microservices architecture: service-to-service communication, monolith vs microservices, API gateway, resilience, saga pattern, distributed systems.",
+  },
+  {
+    name: "Databases & JPA",
+    description:
+      "Databases and persistence: SQL queries, indexes, joins, JPA, Hibernate, ORM, transactions, cascade types, database design and query optimization.",
+  },
+  {
+    name: "Kafka & Messaging",
+    description:
+      "Kafka and messaging: topics, partitions, consumer groups, producers, offsets, duplicate message handling, event streaming, message queues.",
+  },
+  {
+    name: "DevOps & Cloud",
+    description:
+      "DevOps and cloud: Kubernetes, pods, Docker, containers, CI/CD, blue-green deployment, canary deployment, Maven build lifecycle, cloud infrastructure.",
+  },
+  {
+    name: "Patterns & System Design (LLD, HLD)",
+    description:
+      "Design patterns and system design: singleton, factory, builder, SOLID principles, low-level design (LLD), high-level design (HLD), design a parking lot, scalable system design.",
+  },
+  {
+    name: "Scenario",
+    description:
+      "Scenario and situational questions: 'what would you do if', troubleshooting a production issue, debugging a described situation, handling a specific given edge case.",
+  },
+  {
+    name: "Security & Authentication",
+    description:
+      "Security: authentication, authorization, JWT, OAuth, encryption, hashing, secure APIs, common vulnerabilities.",
+  },
+  {
+    name: "GraphQL",
+    description:
+      "GraphQL APIs: schema, queries, mutations, resolvers, and how it compares to REST.",
+  },
+];

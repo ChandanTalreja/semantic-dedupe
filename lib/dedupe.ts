@@ -1,31 +1,28 @@
-import { and, eq, isNull } from "drizzle-orm";
+import { inArray } from "drizzle-orm";
 import { getDb } from "./db";
-import type { Db } from "./db";
 import { qbQuestions, qbQuestionSources } from "./schema";
 import { embedQuestions, judgePairs, secondOpinionSame } from "./ai";
 import { config } from "./config";
 
-// The engine core. Every question from every source flows through here.
+// The engine core — ONE combined pass over every pending source at once
+// (all of tonight's videos together, matched against the existing bank and
+// against each other). This is the performance design: many videos cost one
+// bank load, one set of embedding batches, ONE judge call for all gray-zone
+// pairs, and a couple of bulk inserts — instead of repeating that per video.
 //
-// Performance design: the bank's canonical vectors are loaded into memory
-// ONCE per source, and all nearest-neighbor matching runs in-memory (plain
-// cosine). Writes are batched into two bulk inserts at the end. This
-// replaces ~3 sequential Neon round-trips PER QUESTION (which made a single
-// 60-question video take minutes) with a handful of round-trips total —
-// identical logic and results, without the per-question network latency.
+// Pipeline per distinct question text:
+//   exact-text match to an existing/just-created canonical → attach (no
+//     embedding, no judge: identical text is unambiguously the same)
+//   else embed, then:
+//     cosine >= MATCH_THRESHOLD  → duplicate: attach as variant
+//     cosine <  REVIEW_THRESHOLD → new canonical question
+//     in between                 → one batched judge call (judge →
+//       second-opinion → keep-separate; see lib/ai.ts)
 //
-// Two phases, same as before:
-//   Phase 1 — embed everything in one batched call, then resolve each
-//     question against the in-memory pool:
-//       cosine >= MATCH_THRESHOLD  → duplicate: attach as variant
-//       cosine <  REVIEW_THRESHOLD → new canonical question
-//       in between                 → deferred to phase 2
-//   Phase 2 — ALL gray-zone pairs go to the judge in one batched call
-//     (judge → second-opinion → keep-separate; see lib/ai.ts), verdicts
-//     applied in order.
+// Sections are NOT decided here — a canonical's section is derived at export
+// time from its embedding against the fixed taxonomy (lib/taxonomy.ts).
 // Nothing is ever deleted or skipped: every appearance becomes a
-// qb_question_sources row with its original wording, section, and
-// provenance; when no layer can decide, the question stays its own entry —
+// qb_question_sources row with provenance; undecidable pairs stay separate,
 // visible and mergeable, never buried.
 
 export type SourceInfo = {
@@ -34,15 +31,13 @@ export type SourceInfo = {
   key: string; // identity: yt_video_id | sha256(content)
 };
 
-export type Decision = {
-  question: string;
-  action: "attached" | "created" | "skipped";
-  canonicalText?: string; // set when attached to an existing canonical
-  similarity?: number; // vs the nearest canonical at decision time
-  // which layer settled it: threshold (clear case), judge (Gemma chain),
-  // second-opinion (independent embedding space), fallback (all layers
-  // down — kept separate to be safe)
-  decidedBy?: "threshold" | "judge" | "second-opinion" | "fallback";
+export type SourceResult = {
+  ref: string;
+  created: number; // new canonical questions this source introduced
+  attached: number; // appearances that matched an existing/shared question
+  skipped: number; // already recorded on a previous run
+  undecided: number; // all judge layers unavailable — kept separate to be safe
+  total: number;
 };
 
 export function normalizeQuestion(text: string): string {
@@ -69,25 +64,19 @@ function toVec(v: unknown): number[] {
   return [];
 }
 
-// An entry in the in-memory canonical pool. Existing canonicals carry their
-// real DB id; canonicals created during this run carry a temp index into
+// In-memory canonical pool entry. Existing canonicals carry their real DB
+// id; canonicals created during this run carry a temp index into
 // `newCanonicals`, resolved to a real id at flush time.
-type PoolEntry = {
-  vec: number[];
-  text: string;
-  existingId?: number;
-  newIdx?: number;
-};
+type Ref = { existingId?: number; newIdx?: number };
+type PoolEntry = { vec: number[]; text: string } & Ref;
 
-type SourceRow = {
-  ref: { existingId?: number; newIdx?: number };
-  rawText: string;
-  section: string | null;
-};
+function refOf(e: PoolEntry): Ref {
+  return { existingId: e.existingId, newIdx: e.newIdx };
+}
 
 function nearest(pool: PoolEntry[], vec: number[]) {
   let best: PoolEntry | undefined;
-  let bestSim = -1;
+  let bestSim = -Infinity;
   for (const entry of pool) {
     const sim = cosine(entry.vec, vec);
     if (sim > bestSim) {
@@ -100,67 +89,73 @@ function nearest(pool: PoolEntry[], vec: number[]) {
 
 const INSERT_CHUNK = 200;
 
-async function bulkInsertSources(db: Db, rows: (typeof qbQuestionSources.$inferInsert)[]) {
+async function bulkInsert<T extends Record<string, unknown>>(
+  insert: (rows: T[]) => Promise<unknown>,
+  rows: T[]
+) {
   for (let i = 0; i < rows.length; i += INSERT_CHUNK) {
-    await db.insert(qbQuestionSources).values(rows.slice(i, i + INSERT_CHUNK));
+    await insert(rows.slice(i, i + INSERT_CHUNK));
   }
 }
 
-export async function processQuestions(
-  parsed: { text: string; section: string | null }[],
-  source: SourceInfo
-): Promise<Decision[]> {
+// Process many sources in one pass. Returns a per-source summary (for
+// progress reporting); the deduplicated bank is the durable result.
+export async function processSources(
+  items: { source: SourceInfo; questions: string[] }[]
+): Promise<SourceResult[]> {
   const db = await getDb();
-  const decisions: Decision[] = [];
+  const results = new Map<string, SourceResult>();
+  for (const it of items) {
+    results.set(it.source.key, {
+      ref: it.source.ref,
+      created: 0,
+      attached: 0,
+      skipped: 0,
+      undecided: 0,
+      total: 0,
+    });
+  }
 
-  // Rerun safety without transactions: a crash mid-source leaves the source
-  // unmarked in qb_processed_sources, so it reruns — and here we skip any
-  // question this source already recorded, so nothing duplicates.
-  const existingSources = await db
-    .select({
-      rawText: qbQuestionSources.rawText,
-      section: qbQuestionSources.section,
-    })
-    .from(qbQuestionSources)
-    .where(eq(qbQuestionSources.sourceKey, source.key));
-  const seen = new Set(existingSources.map((r) => r.rawText));
+  // Rerun safety: skip any (source, text) already recorded on a prior run.
+  const keys = items.map((i) => i.source.key);
+  const recorded =
+    keys.length > 0
+      ? await db
+          .select({
+            sourceKey: qbQuestionSources.sourceKey,
+            rawText: qbQuestionSources.rawText,
+          })
+          .from(qbQuestionSources)
+          .where(inArray(qbQuestionSources.sourceKey, keys))
+      : [];
+  const recordedByKey = new Map<string, Set<string>>();
+  for (const r of recorded) {
+    const set = recordedByKey.get(r.sourceKey) ?? new Set<string>();
+    set.add(r.rawText);
+    recordedByKey.set(r.sourceKey, set);
+  }
 
-  const todo: { text: string; section: string | null }[] = [];
-  const backfill: { text: string; section: string }[] = [];
-  for (const item of parsed) {
-    const question = normalizeQuestion(item.text);
-    if (!question) continue;
-    if (seen.has(question)) {
-      if (item.section) backfill.push({ text: question, section: item.section });
-      decisions.push({ question, action: "skipped" });
-      continue;
+  // Build the occurrence list (each source's questions, de-duplicated within
+  // that source and against what it already recorded).
+  type Occ = { source: SourceInfo; text: string };
+  const occurrences: Occ[] = [];
+  for (const { source, questions } of items) {
+    const summary = results.get(source.key)!;
+    const seen = new Set(recordedByKey.get(source.key) ?? []);
+    for (const raw of questions) {
+      const text = normalizeQuestion(raw);
+      if (!text) continue;
+      summary.total++;
+      if (seen.has(text)) {
+        summary.skipped++;
+        continue;
+      }
+      seen.add(text);
+      occurrences.push({ source, text });
     }
-    seen.add(question); // also collapses exact repeats within the source
-    todo.push({ text: question, section: item.section });
   }
 
-  // Backfill sections for rows recorded by a run that predated section
-  // tracking (rare — only on reruns). One statement each; there are few.
-  for (const b of backfill) {
-    await db
-      .update(qbQuestionSources)
-      .set({ section: b.section })
-      .where(
-        and(
-          eq(qbQuestionSources.sourceKey, source.key),
-          eq(qbQuestionSources.rawText, b.text),
-          isNull(qbQuestionSources.section)
-        )
-      );
-  }
-
-  if (todo.length === 0) return decisions;
-
-  const vectors = await embedQuestions(todo.map((t) => t.text));
-
-  // Load the whole bank ONCE into memory. (At bank scale — thousands of
-  // 768-float rows — this is a few MB and a single query; matching is then
-  // pure CPU.)
+  // Load the bank ONCE; build an exact-text index for the short-circuit.
   const bankRows = await db
     .select({
       id: qbQuestions.id,
@@ -173,127 +168,95 @@ export async function processQuestions(
     text: r.text,
     existingId: r.id,
   }));
+  const exactMap = new Map<string, PoolEntry>();
+  for (const e of pool) exactMap.set(e.text, e);
+
+  // Distinct texts, first-seen order; remember each text's first source
+  // (that source "owns" the creation, for created-vs-attached accounting).
+  const uniqueTexts: string[] = [];
+  const firstSource = new Map<string, string>();
+  const textSeen = new Set<string>();
+  for (const occ of occurrences) {
+    if (!textSeen.has(occ.text)) {
+      textSeen.add(occ.text);
+      uniqueTexts.push(occ.text);
+      firstSource.set(occ.text, occ.source.key);
+    }
+  }
+
+  // Embed only texts that aren't an exact match to an existing canonical.
+  const needEmbed = uniqueTexts.filter((t) => !exactMap.has(t));
+  const embedded = await embedQuestions(needEmbed);
+  const textVec = new Map<string, number[]>();
+  needEmbed.forEach((t, i) => textVec.set(t, embedded[i]));
 
   const newCanonicals: { text: string; vec: number[] }[] = [];
-  const sourceRows: SourceRow[] = [];
+  const textRef = new Map<string, Ref>();
+  const createdText = new Set<string>();
 
-  const createCanonical = (text: string, vec: number[]) => {
+  const createCanonical = (text: string, vec: number[]): Ref => {
     const newIdx = newCanonicals.length;
     newCanonicals.push({ text, vec });
-    pool.push({ vec, text, newIdx }); // matchable by later questions this run
-    return newIdx;
+    const entry: PoolEntry = { vec, text, newIdx };
+    pool.push(entry);
+    exactMap.set(text, entry);
+    createdText.add(text);
+    return { newIdx };
   };
 
-  // Phase 1 — resolve clear cases in-memory; defer the gray zone.
-  type Gray = {
-    text: string;
-    section: string | null;
-    vec: number[];
-    nearestRef: { existingId?: number; newIdx?: number };
-    nearestText: string;
-    sim: number;
-  };
+  // Resolve each distinct text to a canonical; defer the gray zone.
+  type Gray = { text: string; vec: number[]; nearestRef: Ref; nearestText: string };
   const gray: Gray[] = [];
-  for (let i = 0; i < todo.length; i++) {
-    const { text, section } = todo[i];
-    const vec = vectors[i];
+  for (const text of uniqueTexts) {
+    const exact = exactMap.get(text);
+    if (exact) {
+      textRef.set(text, refOf(exact)); // exact repeat → attach, no AI
+      continue;
+    }
+    const vec = textVec.get(text)!;
     const hit = nearest(pool, vec);
     if (hit && hit.sim >= config.matchThreshold) {
-      sourceRows.push({
-        ref: { existingId: hit.entry.existingId, newIdx: hit.entry.newIdx },
-        rawText: text,
-        section,
-      });
-      decisions.push({
-        question: text,
-        action: "attached",
-        canonicalText: hit.entry.text,
-        similarity: hit.sim,
-        decidedBy: "threshold",
-      });
+      textRef.set(text, refOf(hit.entry));
     } else if (!hit || hit.sim < config.reviewThreshold) {
-      const newIdx = createCanonical(text, vec);
-      sourceRows.push({ ref: { newIdx }, rawText: text, section });
-      decisions.push({
-        question: text,
-        action: "created",
-        similarity: hit?.sim,
-        decidedBy: "threshold",
-      });
+      textRef.set(text, createCanonical(text, vec));
     } else {
       gray.push({
         text,
-        section,
         vec,
-        nearestRef: { existingId: hit.entry.existingId, newIdx: hit.entry.newIdx },
+        nearestRef: refOf(hit.entry),
         nearestText: hit.entry.text,
-        sim: hit.sim,
       });
     }
   }
 
-  // Phase 2 — one batched judge call for the whole source, applied in order.
+  // ONE batched judge call for every gray-zone pair across all sources.
   const verdicts = await judgePairs(
     gray.map((g) => ({ a: g.text, b: g.nearestText }))
   );
+  const undecidedText = new Set<string>();
   for (let i = 0; i < gray.length; i++) {
     const g = gray[i];
     let same = verdicts[i];
-    let decidedBy: Decision["decidedBy"] = "judge";
-    if (same === null) {
-      same = await secondOpinionSame(g.text, g.nearestText);
-      decidedBy = "second-opinion";
-    }
+    if (same === null) same = await secondOpinionSame(g.text, g.nearestText);
     if (same === null) {
       same = false; // keep separate: visible and mergeable, never buried
-      decidedBy = "fallback";
+      undecidedText.add(g.text);
     }
-
     if (same) {
-      sourceRows.push({ ref: g.nearestRef, rawText: g.text, section: g.section });
-      decisions.push({
-        question: g.text,
-        action: "attached",
-        canonicalText: g.nearestText,
-        similarity: g.sim,
-        decidedBy,
-      });
+      textRef.set(g.text, g.nearestRef);
       continue;
     }
-
-    // Distinct from its judged pair — but the pool grew during this run, so
-    // re-check before creating: a near-identical twin from this same source
-    // may now match outright (settled by threshold alone; no second AI
-    // round for a rare within-source edge).
+    // Pool may have grown during this run — re-check before creating.
     const hit = nearest(pool, g.vec);
     if (hit && hit.sim >= config.matchThreshold) {
-      sourceRows.push({
-        ref: { existingId: hit.entry.existingId, newIdx: hit.entry.newIdx },
-        rawText: g.text,
-        section: g.section,
-      });
-      decisions.push({
-        question: g.text,
-        action: "attached",
-        canonicalText: hit.entry.text,
-        similarity: hit.sim,
-        decidedBy: "threshold",
-      });
+      textRef.set(g.text, refOf(hit.entry));
     } else {
-      const newIdx = createCanonical(g.text, g.vec);
-      sourceRows.push({ ref: { newIdx }, rawText: g.text, section: g.section });
-      decisions.push({
-        question: g.text,
-        action: "created",
-        similarity: g.sim,
-        decidedBy,
-      });
+      textRef.set(g.text, createCanonical(g.text, g.vec));
     }
   }
 
-  // Flush — bulk insert new canonicals (ids come back in VALUES order),
-  // then resolve every source row's ref to a real question id and bulk
-  // insert them.
+  // Flush: bulk insert new canonicals (ids return in VALUES order), then
+  // resolve every occurrence's ref and bulk insert the source rows.
   let newIds: number[] = [];
   if (newCanonicals.length > 0) {
     const inserted = await db
@@ -302,17 +265,29 @@ export async function processQuestions(
       .returning({ id: qbQuestions.id });
     newIds = inserted.map((r) => r.id);
   }
-  await bulkInsertSources(
-    db,
-    sourceRows.map((r) => ({
-      questionId: r.ref.existingId ?? newIds[r.ref.newIdx!],
-      sourceType: source.type,
-      sourceRef: source.ref,
-      sourceKey: source.key,
-      rawText: r.rawText,
-      section: r.section,
+  const resolve = (ref: Ref): number => ref.existingId ?? newIds[ref.newIdx!];
+
+  await bulkInsert(
+    (rows: (typeof qbQuestionSources.$inferInsert)[]) =>
+      db.insert(qbQuestionSources).values(rows),
+    occurrences.map((occ) => ({
+      questionId: resolve(textRef.get(occ.text)!),
+      sourceType: occ.source.type,
+      sourceRef: occ.source.ref,
+      sourceKey: occ.source.key,
+      rawText: occ.text,
     }))
   );
 
-  return decisions;
+  // Per-source created/attached accounting.
+  for (const occ of occurrences) {
+    const s = results.get(occ.source.key)!;
+    const isCreator =
+      createdText.has(occ.text) && firstSource.get(occ.text) === occ.source.key;
+    if (isCreator) s.created++;
+    else s.attached++;
+    if (undecidedText.has(occ.text)) s.undecided++;
+  }
+
+  return items.map((i) => results.get(i.source.key)!);
 }

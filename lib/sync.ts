@@ -7,9 +7,11 @@ import { channels, genres, videoNotes, videos } from "./tubebox";
 // "list the questions" note that haven't been processed yet.
 // Everything is discovered at query time — no hardcoded channels or counts.
 
-// Matches the Interview genre's preset ask leniently (the exact prompt
-// wording may drift; "questions asked" is its stable core).
-const PRESET_PROMPT_PATTERN = "%questions asked%";
+// Matches the Interview genre's "list the questions" ask leniently: the
+// prompt just has to mention "questions" and "asked" in any order. Real
+// wordings vary — "List the interview questions asked" and "what all
+// interview questions are asked" must both match (the earlier
+// "%questions asked%" substring missed the second: "questions ARE asked").
 
 export type PendingVideo = {
   ytVideoId: string;
@@ -87,7 +89,8 @@ export async function findPendingVideos(): Promise<{
       .where(
         and(
           eq(genres.name, "Interview"),
-          ilike(videoNotes.prompt, PRESET_PROMPT_PATTERN),
+          ilike(videoNotes.prompt, "%questions%"),
+          ilike(videoNotes.prompt, "%asked%"),
           sql`NOT EXISTS (
             SELECT 1 FROM qb_processed_sources ps
             WHERE ps.source_key = ${videos.ytVideoId}

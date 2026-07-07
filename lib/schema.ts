@@ -62,6 +62,20 @@ export const qbProcessedSources = pgTable("qb_processed_sources", {
     .defaultNow(),
 });
 
+// Cached embeddings of the fixed section-taxonomy labels (config.taxonomy).
+// Each canonical question is filed under the label it's closest to. Embedded
+// once and refreshed only when a label's description text changes — the
+// bank's grouping needs no LLM at all.
+export const qbTaxonomy = pgTable("qb_taxonomy", {
+  id: serial("id").primaryKey(),
+  name: text("name").notNull().unique(),
+  description: text("description").notNull(),
+  embedding: vector("embedding", { dimensions: config.embeddingDims }).notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
 // Own quota ledger — one row per AI API call (Google exposes no live quota).
 export const qbAiUsage = pgTable("qb_ai_usage", {
   id: serial("id").primaryKey(),

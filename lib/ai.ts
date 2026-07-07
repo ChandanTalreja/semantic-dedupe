@@ -141,36 +141,57 @@ export async function embedQuestions(texts: string[]): Promise<number[][]> {
 // Gemma models take no systemInstruction; everything goes in the user turn.
 // ---------------------------------------------------------------------------
 
-// Run a prompt through the judge chain, expecting JSON back. Records one
-// ledger row per successful API call (even if its JSON later fails to
-// parse — the tokens were spent).
+// Reject if a promise doesn't settle within ms — so one congested Gemma
+// attempt can't stall the whole run.
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${ms}ms`)),
+      ms
+    );
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      }
+    );
+  });
+}
+
+// Run a prompt through the judge chain, expecting JSON back. One attempt per
+// model (the chain itself is the retry), each bounded by judgeTimeoutMs.
+// Records one ledger row per successful API call (even if its JSON later
+// fails to parse — the tokens were spent).
 async function generateJson(prompt: string, kind: string): Promise<unknown> {
   await assertUnderDailyCap(1);
   const db = await getDb();
   let lastErr: unknown;
   for (const model of config.judgeModels) {
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        const res = await genai().models.generateContent({
+    try {
+      const res = await withTimeout(
+        genai().models.generateContent({
           model,
           contents: prompt,
           config: { temperature: 0 },
-        });
-        await db.insert(qbAiUsage).values({
-          model,
-          kind,
-          tokens: res.usageMetadata?.totalTokenCount ?? null,
-        });
-        const text = (res.text ?? "").replace(/```(json)?/gi, "").trim();
-        return JSON.parse(text);
-      } catch (err) {
-        lastErr = err;
-        const msg = err instanceof Error ? err.message : String(err);
-        console.warn(
-          `${kind} via ${model} attempt ${attempt} failed: ${msg.slice(0, 160)}`
-        );
-        await sleep(2);
-      }
+        }),
+        config.judgeTimeoutMs,
+        `${kind} via ${model}`
+      );
+      await db.insert(qbAiUsage).values({
+        model,
+        kind,
+        tokens: res.usageMetadata?.totalTokenCount ?? null,
+      });
+      const text = (res.text ?? "").replace(/```(json)?/gi, "").trim();
+      return JSON.parse(text);
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`${kind} via ${model} failed: ${msg.slice(0, 160)}`);
     }
   }
   throw lastErr;
@@ -258,39 +279,3 @@ export async function secondOpinionSame(
   }
 }
 
-// Map raw section headings from different sources onto canonical names
-// ("Java Core" vs "Core Java Concepts" → one heading). One call for the
-// whole batch through the judge chain; results are cached forever in
-// qb_section_map by the caller. Fail-open: on any error each name maps to
-// itself — the export is then less tidy, never wrong or blocked.
-export async function reconcileSections(
-  rawNames: string[]
-): Promise<Record<string, string>> {
-  const identity = Object.fromEntries(rawNames.map((n) => [n, n]));
-  if (rawNames.length === 0) return identity;
-  try {
-    const prompt = [
-      "These section headings come from several interview-question lists.",
-      "Group headings that cover the same topic under one short canonical",
-      "heading (e.g. 'Java Core', 'Spring Boot', 'Kafka'). Reply with ONLY",
-      "a JSON object mapping every input heading to its canonical heading.",
-      "Every input heading must appear as a key exactly as written.",
-      "",
-      JSON.stringify(rawNames),
-    ].join("\n");
-    const mapping = (await generateJson(prompt, "sections")) as Record<
-      string,
-      unknown
-    >;
-    const result: Record<string, string> = {};
-    for (const name of rawNames) {
-      const mapped = mapping?.[name];
-      result[name] =
-        typeof mapped === "string" && mapped.trim() ? mapped.trim() : name;
-    }
-    return result;
-  } catch (err) {
-    console.error("section reconciliation failed (using raw names):", err);
-    return identity;
-  }
-}

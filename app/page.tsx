@@ -1,12 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
-// One button. Preview checks the database for videos not yet processed
-// (everything already processed is cached and never redone), runs only the
-// new ones through the dedupe engine, then opens the merged master list
-// right here. Download saves the same document as .md — only when clicked.
-// Nothing is fetched on page load.
+// The master-list page. On load it shows the current bank immediately.
+// Preview runs one combined sync pass over all pending TUBEBOX videos, then
+// re-renders the merged master list. Download saves the same document as
+// .md — only when clicked.
 
 type ExportQuestion = { id: number; text: string; count: number };
 type ExportSection = { name: string; questions: ExportQuestion[] };
@@ -18,14 +17,13 @@ type ExportData = {
   markdown: string;
 };
 
-type Decision = {
-  action: "attached" | "created" | "skipped";
-  decidedBy?: string;
-};
-type ProcessedVideo = {
+type Processed = {
   title: string;
   questionCount: number;
-  decisions: Decision[];
+  created: number;
+  attached: number;
+  skipped: number;
+  undecided: number;
 };
 
 const btn =
@@ -39,57 +37,62 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  async function loadDocument() {
+  const loadDocument = useCallback(async () => {
     const res = await fetch("/api/export");
     const data = await res.json();
     if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
     setDoc(data);
-  }
+  }, []);
+
+  useEffect(() => {
+    // show the existing master list immediately on load
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    loadDocument().catch((e) =>
+      setError(e instanceof Error ? e.message : "failed to load")
+    );
+  }, [loadDocument]);
 
   async function preview() {
     setBusy(true);
     setError(null);
-    setStatus("Checking the database for new videos…");
+    setStatus("Checking TUBEBOX for new videos…");
+    // Accumulate across chunks — each /api/sync call handles a few videos
+    // and commits; we loop until none remain, refreshing the document as we
+    // go so progress is visible and durable.
     let videos = 0;
     let created = 0;
-    let matched = 0;
+    let attached = 0;
+    let undecided = 0;
     try {
       for (;;) {
         const res = await fetch("/api/sync", { method: "POST" });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
-        const processed: ProcessedVideo[] = data.processed;
-        if (processed.length === 0) break;
-        let undecided = 0;
+        const processed: Processed[] = data.processed;
+        if (processed.length === 0 && videos === 0) {
+          setStatus("No new videos — this is the current master list.");
+          break;
+        }
         for (const v of processed) {
           videos++;
-          created += v.decisions.filter((d) => d.action === "created").length;
-          matched += v.decisions.filter((d) => d.action === "attached").length;
-          undecided += v.decisions.filter((d) => d.decidedBy === "fallback").length;
-          setStatus(
-            `Processed “${v.title}” — ${data.remaining} video(s) remaining…` +
-              (undecided > 0
-                ? ` (${undecided} kept separate: judges unavailable)`
-                : "")
-          );
+          created += v.created;
+          attached += v.attached;
+          undecided += v.undecided;
         }
+        await loadDocument(); // durable, visible progress after each chunk
+        setStatus(
+          `Merged ${videos} video(s): ${created} new questions, ${attached} matched` +
+            (undecided > 0 ? ` · ${undecided} kept separate` : "") +
+            (data.remaining > 0 ? ` — ${data.remaining} video(s) left…` : " — done.")
+        );
         if (data.remaining === 0) break;
       }
-      setStatus(
-        videos > 0
-          ? `Merged ${videos} new video(s): ${created} new questions, ${matched} matched existing ones.`
-          : "No new videos — this is the current master list."
-      );
-      await loadDocument();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "something went wrong");
-      setStatus(null);
-      // show whatever already exists — partial progress is saved progress
-      try {
-        await loadDocument();
-      } catch {
-        /* nothing to show yet */
-      }
+      setError(
+        (err instanceof Error ? err.message : "something went wrong") +
+          (videos > 0 ? ` (${videos} video(s) already saved)` : "")
+      );
+      await loadDocument().catch(() => {}); // partial progress is saved
     } finally {
       setBusy(false);
     }
@@ -106,6 +109,8 @@ export default function Home() {
     URL.revokeObjectURL(url);
   }
 
+  const hasContent = (doc?.totalUnique ?? 0) > 0;
+
   return (
     <main className="mx-auto w-full max-w-3xl px-6 py-10">
       <h1 className="text-3xl font-black uppercase tracking-tight">
@@ -119,7 +124,7 @@ export default function Home() {
         <button className={`${btn} bg-violet-300`} disabled={busy} onClick={preview}>
           {busy ? "Working…" : "Preview"}
         </button>
-        {doc && doc.totalUnique > 0 && (
+        {hasContent && (
           <button className={btn} disabled={busy} onClick={download}>
             Download .md
           </button>
@@ -133,24 +138,23 @@ export default function Home() {
         </p>
       )}
 
-      {!doc && !busy && !error && (
+      {doc && !hasContent && !busy && (
         <p className="mt-10 text-zinc-500">
-          Hit <span className="font-bold uppercase">Preview</span> to check for
-          newly asked videos, merge them into the bank, and read the master
-          list here.
+          The bank is empty — ask “List the interview questions” on your TUBEBOX
+          videos, then hit <span className="font-bold uppercase">Preview</span>.
         </p>
       )}
 
-      {doc && doc.totalUnique > 0 && (
+      {hasContent && (
         <article className="mt-6 border-2 border-black bg-white p-8 shadow-[6px_6px_0_0_#000]">
           <h2 className="text-2xl font-black">
             Interview Questions — Master List
           </h2>
           <p className="mt-2 border-l-4 border-violet-300 pl-3 text-sm text-zinc-600">
-            {doc.totalUnique} unique questions from {doc.totalAsked}{" "}
-            appearances across sources · generated {doc.generatedAt}
+            {doc!.totalUnique} unique questions from {doc!.totalAsked}{" "}
+            appearances across sources · generated {doc!.generatedAt}
           </p>
-          {doc.sections.map((section) => (
+          {doc!.sections.map((section) => (
             <section key={section.name} className="mt-6">
               <h3 className="border-b-2 border-black pb-1 text-lg font-black">
                 {section.name}
@@ -171,13 +175,6 @@ export default function Home() {
             </section>
           ))}
         </article>
-      )}
-
-      {doc && doc.totalUnique === 0 && (
-        <p className="mt-10 text-zinc-500">
-          The bank is empty — ask “List the interview questions” on your
-          TUBEBOX videos first, then Preview again.
-        </p>
       )}
     </main>
   );

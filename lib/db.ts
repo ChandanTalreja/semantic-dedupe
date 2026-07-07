@@ -48,6 +48,13 @@ function ddl(): string[] {
       canonical text NOT NULL,
       created_at timestamptz NOT NULL DEFAULT now()
     )`,
+    `CREATE TABLE IF NOT EXISTS qb_taxonomy (
+      id serial PRIMARY KEY,
+      name text NOT NULL UNIQUE,
+      description text NOT NULL,
+      embedding vector(${config.embeddingDims}) NOT NULL,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )`,
     `CREATE TABLE IF NOT EXISTS qb_ai_usage (
       id serial PRIMARY KEY,
       model text NOT NULL,

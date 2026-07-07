@@ -1,11 +1,14 @@
 import { asc } from "drizzle-orm";
 import { getDb } from "./db";
-import { qbQuestions, qbQuestionSources, qbSectionMap } from "./schema";
+import { qbQuestions, qbQuestionSources } from "./schema";
+import { assignSection, loadLabels } from "./taxonomy";
+import { config } from "./config";
 
-// Assemble the master list: every canonical question, grouped under
-// reconciled section headings, with "asked in N sources" counts. Pure read
-// — section-name reconciliation is computed (and cached) during sync, and
-// any heading not yet in the cache falls back to its raw name.
+// Assemble the master list: every canonical question, filed under the fixed
+// taxonomy (each question's section = nearest label to its embedding, done
+// in-memory here so it always reflects the current taxonomy), with "asked
+// in N sources" counts. Pure read — no AI calls (labels are embedded during
+// sync). Sections appear in the taxonomy's configured order.
 
 export type ExportQuestion = { id: number; text: string; count: number };
 export type ExportSection = { name: string; questions: ExportQuestion[] };
@@ -18,62 +21,54 @@ export type ExportData = {
 
 const FALLBACK_SECTION = "Other";
 
+function toVec(v: unknown): number[] {
+  if (Array.isArray(v)) return v as number[];
+  if (typeof v === "string") return JSON.parse(v);
+  return [];
+}
+
 export async function assembleExport(): Promise<ExportData> {
   const db = await getDb();
   const questions = await db
-    .select({ id: qbQuestions.id, text: qbQuestions.text })
+    .select({
+      id: qbQuestions.id,
+      text: qbQuestions.text,
+      embedding: qbQuestions.embedding,
+    })
     .from(qbQuestions)
     .orderBy(asc(qbQuestions.id));
   const sources = await db
-    .select({
-      questionId: qbQuestionSources.questionId,
-      section: qbQuestionSources.section,
-    })
-    .from(qbQuestionSources)
-    .orderBy(asc(qbQuestionSources.id));
-  const mapRows = await db.select().from(qbSectionMap);
-  const canonicalName = new Map(mapRows.map((r) => [r.raw, r.canonical]));
+    .select({ questionId: qbQuestionSources.questionId })
+    .from(qbQuestionSources);
+  const labels = await loadLabels();
 
-  // Per question: variant count + the most common section among its
-  // variants (earliest seen wins ties).
   const counts = new Map<number, number>();
-  const sectionVotes = new Map<number, Map<string, number>>();
   for (const s of sources) {
     counts.set(s.questionId, (counts.get(s.questionId) ?? 0) + 1);
-    if (s.section) {
-      const mapped = canonicalName.get(s.section) ?? s.section;
-      const votes = sectionVotes.get(s.questionId) ?? new Map();
-      votes.set(mapped, (votes.get(mapped) ?? 0) + 1);
-      sectionVotes.set(s.questionId, votes);
-    }
   }
 
   const bySection = new Map<string, ExportQuestion[]>();
   for (const q of questions) {
-    let best = FALLBACK_SECTION;
-    let bestVotes = 0;
-    for (const [name, votes] of sectionVotes.get(q.id) ?? []) {
-      if (votes > bestVotes) {
-        best = name;
-        bestVotes = votes;
-      }
-    }
-    const list = bySection.get(best) ?? [];
+    const section = assignSection(toVec(q.embedding), labels);
+    const list = bySection.get(section) ?? [];
     list.push({ id: q.id, text: q.text, count: counts.get(q.id) ?? 0 });
-    bySection.set(best, list);
+    bySection.set(section, list);
   }
 
-  const sections = [...bySection.entries()]
-    .map(([name, qs]) => ({
-      name,
-      questions: qs.sort((a, b) => b.count - a.count || a.id - b.id),
-    }))
-    // biggest sections first; "Other" always last
-    .sort((a, b) => {
-      if (a.name === FALLBACK_SECTION) return 1;
-      if (b.name === FALLBACK_SECTION) return -1;
-      return b.questions.length - a.questions.length;
-    });
+  // Emit sections in the taxonomy's configured order; "Other" (unmatched)
+  // last. Within a section, most-asked first.
+  const order = config.taxonomy.map((t) => t.name);
+  order.push(FALLBACK_SECTION);
+  const sections: ExportSection[] = [];
+  for (const name of order) {
+    const qs = bySection.get(name);
+    if (qs && qs.length > 0) {
+      sections.push({
+        name,
+        questions: qs.sort((a, b) => b.count - a.count || a.id - b.id),
+      });
+    }
+  }
 
   return {
     sections,

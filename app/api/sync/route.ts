@@ -1,43 +1,16 @@
-import { isNotNull, notInArray, sql } from "drizzle-orm";
-import { getDb } from "@/lib/db";
-import { qbQuestionSources, qbSectionMap } from "@/lib/schema";
 import { findPendingVideos, markProcessed, parseQuestions } from "@/lib/sync";
-import { processQuestions } from "@/lib/dedupe";
-import { reconcileSections } from "@/lib/ai";
+import { processSources } from "@/lib/dedupe";
+import { ensureTaxonomy } from "@/lib/taxonomy";
 import { config } from "@/lib/config";
 
-// POST /api/sync — process up to SYNC_BATCH_SIZE pending videos through the
-// dedupe engine (bounded work per request; the UI loops until remaining is
-// 0), then reconcile any new section headings. Never mutate on GET.
-
-async function reconcileNewSections(): Promise<void> {
-  const db = await getDb();
-  const known = (await db.select({ raw: qbSectionMap.raw }).from(qbSectionMap)).map(
-    (r) => r.raw
-  );
-  const unmappedRows = await db
-    .selectDistinct({ section: qbQuestionSources.section })
-    .from(qbQuestionSources)
-    .where(
-      known.length > 0
-        ? sql`${isNotNull(qbQuestionSources.section)} AND ${notInArray(qbQuestionSources.section, known)}`
-        : isNotNull(qbQuestionSources.section)
-    );
-  const unmapped = unmappedRows
-    .map((r) => r.section)
-    .filter((s): s is string => s !== null);
-  if (unmapped.length === 0) return;
-  // Include known canonical names as context so new sources converge on the
-  // same headings instead of inventing parallel ones.
-  const canonicals = [
-    ...new Set((await db.select().from(qbSectionMap)).map((r) => r.canonical)),
-  ];
-  const mapping = await reconcileSections([...unmapped, ...canonicals]);
-  await db
-    .insert(qbSectionMap)
-    .values(unmapped.map((raw) => ({ raw, canonical: mapping[raw] ?? raw })))
-    .onConflictDoNothing();
-}
+// POST /api/sync — process ONE chunk of pending TUBEBOX videos
+// (config.syncBatchSize) in a combined pass (see lib/dedupe.processSources):
+// one bank load, one set of embedding batches, one judge call for every
+// gray-zone pair, bulk inserts. Returns { processed, remaining }; the UI
+// loops until remaining is 0. Chunking commits each batch, so the daily
+// embedding cap (or any mid-run failure) never wipes work already saved.
+// Sections come from the fixed taxonomy at export time — no per-video AI
+// section call. Never mutate on GET.
 
 export async function POST() {
   try {
@@ -51,41 +24,44 @@ export async function POST() {
         { status: 409 }
       );
     }
+    // Embed any new/changed taxonomy labels once (cached in qb_taxonomy).
+    // Runs even with nothing pending, so a plain Preview re-files the
+    // existing bank under the current taxonomy.
+    await ensureTaxonomy();
 
-    const batch = pending.slice(0, config.syncBatchSize);
-    const processed = [];
-    for (const video of batch) {
-      const questions = parseQuestions(video.answer);
-      const decisions = await processQuestions(questions, {
-        type: "tubebox_video",
-        ref: video.ytVideoId,
-        key: video.ytVideoId,
-      });
-      // Even a zero-question parse is marked done — otherwise it would
-      // block the queue forever; the response flags it for a human look.
-      await markProcessed({
-        type: "tubebox_video",
-        key: video.ytVideoId,
-        ref: video.ytVideoId,
-      });
-      processed.push({
-        ytVideoId: video.ytVideoId,
-        title: video.title,
-        questionCount: questions.length,
-        decisions,
-      });
+    if (pending.length === 0) {
+      return Response.json({ processed: [], remaining: 0 });
     }
 
-    // Best-effort: a failure here never fails the sync — the export falls
-    // back to raw section names until the next run retries.
-    try {
-      if (processed.length > 0) await reconcileNewSections();
-    } catch (err) {
-      console.error("section reconciliation pass failed:", err);
+    // One chunk this request; the UI calls again for the rest.
+    const batch = pending.slice(0, config.syncBatchSize);
+    const items = batch.map((v) => ({
+      source: {
+        type: "tubebox_video" as const,
+        ref: v.ytVideoId,
+        key: v.ytVideoId,
+      },
+      questions: parseQuestions(v.answer).map((q) => q.text),
+    }));
+
+    const results = await processSources(items);
+
+    // Mark this chunk's videos processed only after their rows are committed.
+    const titleByRef = new Map(batch.map((v) => [v.ytVideoId, v.title]));
+    for (const r of results) {
+      await markProcessed({ type: "tubebox_video", key: r.ref, ref: r.ref });
     }
 
     return Response.json({
-      processed,
+      processed: results.map((r) => ({
+        ytVideoId: r.ref,
+        title: titleByRef.get(r.ref) ?? r.ref,
+        questionCount: r.total,
+        created: r.created,
+        attached: r.attached,
+        skipped: r.skipped,
+        undecided: r.undecided,
+      })),
       remaining: pending.length - batch.length,
     });
   } catch (err) {
