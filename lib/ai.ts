@@ -35,6 +35,7 @@ async function jinaEmbed(texts: string[]): Promise<number[][]> {
       model: config.jinaEmbeddingModel,
       input: texts,
       task: "text-matching", // optimal for semantic similarity / dedup
+      dimensions: config.embeddingDims, // match pgvector column (768)
     }),
   });
   if (!res.ok) {
