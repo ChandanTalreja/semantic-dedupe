@@ -87,14 +87,33 @@ function nearest(pool: PoolEntry[], vec: number[]) {
   return best ? { entry: best, sim: bestSim } : undefined;
 }
 
-const INSERT_CHUNK = 200;
+// Chunk size for bulk inserts. Each qb_questions row carries a 768-dim
+// embedding vector (~6 KB of SQL), so the chunk must stay small enough
+// that the total INSERT statement fits within Neon's HTTP query limit.
+// 50 rows × 768 floats ≈ 30 KB per query — comfortably under the limit.
+const QUESTION_CHUNK = 50;
+const SOURCE_CHUNK = 200;
+
+async function chunkedInsert<T extends Record<string, unknown>>(
+  insert: (rows: T[]) => Promise<{ id: number }[]>,
+  rows: T[]
+): Promise<number[]> {
+  const ids: number[] = [];
+  for (let i = 0; i < rows.length; i += QUESTION_CHUNK) {
+    const chunk = rows.slice(i, i + QUESTION_CHUNK);
+    const inserted = await insert(chunk);
+    for (const row of inserted) ids.push(row.id);
+  }
+  return ids;
+}
 
 async function bulkInsert<T extends Record<string, unknown>>(
   insert: (rows: T[]) => Promise<unknown>,
-  rows: T[]
+  rows: T[],
+  chunkSize: number
 ) {
-  for (let i = 0; i < rows.length; i += INSERT_CHUNK) {
-    await insert(rows.slice(i, i + INSERT_CHUNK));
+  for (let i = 0; i < rows.length; i += chunkSize) {
+    await insert(rows.slice(i, i + chunkSize));
   }
 }
 
@@ -251,19 +270,23 @@ export async function processSources(
     if (hit && hit.sim >= config.matchThreshold) {
       textRef.set(g.text, refOf(hit.entry));
     } else {
-      textRef.set(g.text, createCanonical(g.text, g.vec));
+      textRef.set(text, createCanonical(g.text, g.vec));
     }
   }
 
-  // Flush: bulk insert new canonicals (ids return in VALUES order), then
-  // resolve every occurrence's ref and bulk insert the source rows.
+  // Flush: chunk-insert new canonicals (ids return in VALUES order within
+  // each chunk, so we concatenate them in order), then resolve every
+  // occurrence's ref and bulk-insert the source rows.
   let newIds: number[] = [];
   if (newCanonicals.length > 0) {
-    const inserted = await db
-      .insert(qbQuestions)
-      .values(newCanonicals.map((c) => ({ text: c.text, embedding: c.vec })))
-      .returning({ id: qbQuestions.id });
-    newIds = inserted.map((r) => r.id);
+    newIds = await chunkedInsert(
+      (rows) =>
+        db
+          .insert(qbQuestions)
+          .values(rows)
+          .returning({ id: qbQuestions.id }),
+      newCanonicals.map((c) => ({ text: c.text, embedding: c.vec }))
+    );
   }
   const resolve = (ref: Ref): number => ref.existingId ?? newIds[ref.newIdx!];
 
@@ -276,7 +299,8 @@ export async function processSources(
       sourceRef: occ.source.ref,
       sourceKey: occ.source.key,
       rawText: occ.text,
-    }))
+    })),
+    SOURCE_CHUNK
   );
 
   // Per-source created/attached accounting.
