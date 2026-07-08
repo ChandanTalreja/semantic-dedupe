@@ -67,7 +67,7 @@ export async function ensureTaxonomy(): Promise<Label[]> {
     (d) => byName.get(d.name)?.description !== d.description
   );
   if (stale.length > 0) {
-    const vecs = await embedQuestions(stale.map((d) => d.description);
+    const vecs = await embedQuestions(stale.map((d) => d.description));
     for (let i = 0; i < stale.length; i++) {
       await db
         .insert(qbTaxonomy)
