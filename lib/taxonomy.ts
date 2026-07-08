@@ -1,6 +1,6 @@
 import { inArray } from "drizzle-orm";
 import { getDb } from "./db";
-import { qbTaxonomy } from "./schema";
+import { qbQuestions, qbTaxonomy } from "./schema";
 import { embedQuestions } from "./ai";
 import { config } from "./config";
 
@@ -10,6 +10,36 @@ import { config } from "./config";
 // no LLM, always the same clean headings — see config.taxonomy.
 
 export type Label = { name: string; vec: number[] };
+
+// Detect whether cached taxonomy embeddings are from a different embedding
+// provider than the current question bank. When the provider changes
+// (e.g., Gemini → Jina), the vector spaces are incompatible — cosine
+// similarities between old taxonomy vectors and new question vectors are
+// meaningless, causing random misclassification (e.g., multithreading →
+// coding). We detect this by sampling one bank question against the cached
+// labels: if ALL similarities are very low (< 0.2), the spaces don't match.
+async function spacesMismatched(): Promise<boolean> {
+  const db = await getDb();
+  const [sample] = await db
+    .select({ embedding: qbQuestions.embedding })
+    .from(qbQuestions)
+    .limit(1);
+  if (!sample) return false; // no questions yet — nothing to compare
+
+  const labels = await db.select().from(qbTaxonomy).limit(3);
+  if (labels.length === 0) return false;
+
+  const qVec = toVec(sample.embedding);
+  let allVeryLow = true;
+  for (const label of labels) {
+    const sim = cosine(qVec, toVec(label.embedding));
+    if (sim >= 0.2) {
+      allVeryLow = false;
+      break;
+    }
+  }
+  return allVeryLow;
+}
 
 // Ensure every current taxonomy label has a cached embedding, re-embedding
 // only labels whose description changed, and dropping labels removed from
@@ -21,12 +51,23 @@ export async function ensureTaxonomy(): Promise<Label[]> {
   const existing = await db.select().from(qbTaxonomy);
   const byName = new Map(existing.map((r) => [r.name, r]));
 
+  // If the embedding provider changed (Gemini → Jina), all cached vectors
+  // are in the wrong space. Clear them so everything gets re-embedded.
+  if (await spacesMismatched()) {
+    console.warn(
+      "Taxonomy embeddings are from a different provider than the question bank — clearing and re-embedding all labels"
+    );
+    await db.delete(qbTaxonomy);
+    byName.clear();
+    existing.length = 0;
+  }
+
   // Labels to (re)embed: new, or description edited.
   const stale = desired.filter(
     (d) => byName.get(d.name)?.description !== d.description
   );
   if (stale.length > 0) {
-    const vecs = await embedQuestions(stale.map((d) => d.description));
+    const vecs = await embedQuestions(stale.map((d) => d.description);
     for (let i = 0; i < stale.length; i++) {
       await db
         .insert(qbTaxonomy)
