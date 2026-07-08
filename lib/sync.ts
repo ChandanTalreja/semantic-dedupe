@@ -63,10 +63,20 @@ export function parseQuestions(answer: string): ParsedQuestion[] {
 
 // In PGlite demo mode TUBEBOX's tables don't exist — that's expected,
 // not an error; the sync feature just has nothing to offer.
+// PGlite/Drizzle wraps the underlying Postgres error in `err.cause`, so we
+// must check both the top-level error and the nested cause for the code.
 function isMissingTableError(err: unknown): boolean {
-  const code = (err as { code?: string }).code;
+  const topCode = (err as { code?: string }).code;
+  const causeCode = (err as { cause?: { code?: string } }).cause?.code;
   const message = err instanceof Error ? err.message : String(err);
-  return code === "42P01" || /does not exist/i.test(message);
+  const causeMessage = (err as { cause?: { message?: string } }).cause
+    ?.message;
+  return (
+    topCode === "42P01" ||
+    causeCode === "42P01" ||
+    /does not exist/i.test(message) ||
+    /does not exist/i.test(causeMessage ?? "")
+  );
 }
 
 export async function findPendingVideos(): Promise<{
