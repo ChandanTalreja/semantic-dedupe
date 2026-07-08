@@ -1,14 +1,93 @@
 import { GoogleGenAI } from "@google/genai";
+import OpenAI from "openai";
 import { count, gte } from "drizzle-orm";
 import { getDb } from "./db";
 import { qbAiUsage } from "./schema";
 import { config } from "./config";
 
-// All Gemini API access lives here: embeddings now, Gemma judge/extract
-// later. Every call is recorded in the qb_ai_usage ledger and gated by the
-// app-level daily cap (Google's API exposes no remaining-quota signal).
+// ============================================================================
+// Three-tier embedding provider stack:
+//   1. Jina AI   — primary (free 2,000 RPM, 10M tokens, no card needed)
+//   2. OpenAI    — fallback (requires payment method, 100-3,000 RPM)
+//   3. Gemini    — emergency fallback + judge/second-opinion (existing)
+//
+// The fallback chain is tried once per provider: if the primary fails for
+// any reason (rate limit, auth error, network), we move to the next.
+// Everything processed so far is saved, so a mid-run failure is recoverable.
+// ============================================================================
 
-let client: GoogleGenAI | undefined;
+// ---------------------------------------------------------------------------
+// Provider 1: Jina AI (HTTP, no SDK needed)
+// ---------------------------------------------------------------------------
+
+async function jinaEmbed(texts: string[]): Promise<number[][]> {
+  const apiKey = config.jinaApiKey;
+  if (!apiKey) {
+    throw new Error("JINA_API_KEY not set");
+  }
+  const res = await fetch(`${config.jinaBaseUrl}/embeddings`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: config.jinaEmbeddingModel,
+      input: texts,
+      task: "text-matching", // optimal for semantic similarity / dedup
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Jina ${res.status}: ${body.slice(0, 200)}`);
+  }
+  const json = (await res.json()) as {
+    data?: { embedding: number[] }[];
+  };
+  const embeddings = json.data ?? [];
+  if (embeddings.length !== texts.length) {
+    throw new Error(
+      `Jina returned ${embeddings.length} vectors for ${texts.length} inputs`
+    );
+  }
+  return embeddings.map((e) => e.embedding);
+}
+
+// ---------------------------------------------------------------------------
+// Provider 2: OpenAI
+// ---------------------------------------------------------------------------
+
+let openaiClient: OpenAI | undefined;
+
+function getOpenAI(): OpenAI {
+  const apiKey = config.openaiApiKey;
+  if (!apiKey) {
+    throw new Error("OPENAI_API_KEY not set");
+  }
+  openaiClient ??= new OpenAI({ apiKey });
+  return openaiClient;
+}
+
+async function openaiEmbed(texts: string[]): Promise<number[][]> {
+  const res = await getOpenAI().embeddings.create({
+    model: config.openaiEmbeddingModel,
+    input: texts,
+    dimensions: config.embeddingDims, // truncate to match bank (768)
+  });
+  if (res.data.length !== texts.length) {
+    throw new Error(
+      `OpenAI returned ${res.data.length} vectors for ${texts.length} inputs`
+    );
+  }
+  // Return in the same order as input (OpenAI preserves order)
+  return res.data.map((d) => d.embedding);
+}
+
+// ---------------------------------------------------------------------------
+// Provider 3: Gemini (existing — judge, second-opinion, emergency embed)
+// ---------------------------------------------------------------------------
+
+let geminiClient: GoogleGenAI | undefined;
 
 function genai(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -17,19 +96,73 @@ function genai(): GoogleGenAI {
       "GEMINI_API_KEY is not set — get a free key at aistudio.google.com and put it in .env.local"
     );
   }
-  client ??= new GoogleGenAI({ apiKey });
-  return client;
+  geminiClient ??= new GoogleGenAI({ apiKey });
+  return geminiClient;
 }
 
-// Google's docs: embeddings truncated below the native 3072 dims are no
-// longer unit-length, so they MUST be re-normalized for cosine math to be
-// correct.
+// Google's docs: embeddings truncated below the native dims are no longer
+// unit-length, so they MUST be re-normalized for cosine math to be correct.
 function l2Normalize(values: number[]): number[] {
   const norm = Math.sqrt(values.reduce((sum, x) => sum + x * x, 0));
   if (!(norm > 0)) {
     throw new Error("embedding has zero magnitude — API returned bad data");
   }
   return values.map((x) => x / norm);
+}
+
+async function geminiEmbed(texts: string[]): Promise<number[][]> {
+  const res = await genai().models.embedContent({
+    model: config.embeddingModel,
+    contents: texts,
+    config: {
+      taskType: "SEMANTIC_SIMILARITY",
+      outputDimensionality: config.embeddingDims,
+    },
+  });
+  const embeddings = res.embeddings ?? [];
+  if (embeddings.length !== texts.length) {
+    throw new Error(
+      `Gemini returned ${embeddings.length} vectors for ${texts.length} inputs`
+    );
+  }
+  return embeddings.map((e) => l2Normalize(e.values ?? []));
+}
+
+// ---------------------------------------------------------------------------
+// Provider-agnostic embedding with tiered fallback
+// ---------------------------------------------------------------------------
+
+// Jina and OpenAI both accept up to 2,048 texts per request. 1,024 keeps
+// memory comfortable while fitting 25 videos worth of questions in one go.
+const EMBED_BATCH_SIZE = 1024;
+
+// One retry per provider for transient failures (network blips).
+const PROVIDER_RETRIES = 1;
+
+const sleep = (seconds: number) =>
+  new Promise((resolve) => setTimeout(resolve, seconds * 1000));
+
+async function tryProvider<T>(
+  label: string,
+  fn: () => Promise<T>,
+  retries: number
+): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      if (attempt < retries) {
+        console.warn(`${label} attempt ${attempt + 1} failed, retrying: ${msg.slice(0, 160)}`);
+        await sleep(1);
+      } else {
+        console.warn(`${label} failed after ${retries + 1} attempts: ${msg.slice(0, 160)}`);
+      }
+    }
+  }
+  throw lastErr;
 }
 
 async function assertUnderDailyCap(upcomingCalls: number): Promise<void> {
@@ -47,30 +180,8 @@ async function assertUnderDailyCap(upcomingCalls: number): Promise<void> {
   }
 }
 
-// The batch endpoint accepts up to 100 texts per request — but the free
-// tier's 100 requests/min quota counts each TEXT, so large sources can trip
-// it mid-sync regardless of batching.
-const EMBED_BATCH_SIZE = 90;
-
-function isRateLimit(err: unknown): boolean {
-  const e = err as { status?: number; message?: string };
-  return (
-    e?.status === 429 ||
-    /RESOURCE_EXHAUSTED|"code"\s*:\s*429/.test(String(e?.message ?? ""))
-  );
-}
-
-// Google's 429 payload includes RetryInfo, e.g. "retryDelay":"30s".
-function retryDelaySeconds(err: unknown): number {
-  const msg = err instanceof Error ? err.message : String(err);
-  const m = msg.match(/retryDelay[^\d]*(\d+)/);
-  return m ? Number(m[1]) : 30;
-}
-
-const sleep = (seconds: number) =>
-  new Promise((resolve) => setTimeout(resolve, seconds * 1000));
-
 // Embed question texts, batched, L2-normalized, ledger-recorded.
+// Tiered fallback: Jina → OpenAI → Gemini.
 // Returns one vector per input text, in the same order.
 export async function embedQuestions(texts: string[]): Promise<number[][]> {
   if (texts.length === 0) return [];
@@ -79,52 +190,73 @@ export async function embedQuestions(texts: string[]): Promise<number[][]> {
 
   const db = await getDb();
   const vectors: number[][] = [];
+
   for (let i = 0; i < texts.length; i += EMBED_BATCH_SIZE) {
     const batch = texts.slice(i, i + EMBED_BATCH_SIZE);
-    const call = () =>
-      genai().models.embedContent({
-        model: config.embeddingModel,
-        contents: batch,
-        config: {
-          taskType: "SEMANTIC_SIMILARITY",
-          outputDimensionality: config.embeddingDims,
-        },
-      });
-    let res;
-    try {
-      res = await call();
-    } catch (err) {
-      if (!isRateLimit(err)) throw err;
-      // Wait out the per-minute window once, then retry. (Local-first
-      // behavior — a hosted function timeout would kill a wait this long;
-      // revisit if this app ever deploys.)
-      const wait = Math.min(retryDelaySeconds(err) + 2, 70);
-      console.warn(`embedding rate limit — waiting ${wait}s and retrying`);
-      await sleep(wait);
+    let batchVectors: number[][] | undefined;
+    let providerUsed = "";
+
+    // --- Tier 1: Jina AI (primary) ---
+    if (config.jinaApiKey) {
       try {
-        res = await call();
-      } catch (err2) {
-        if (isRateLimit(err2)) {
-          throw new Error(
-            "Gemini embedding rate limit (100 texts/min on the free tier) — wait a minute and press Preview again; everything processed so far is saved."
-          );
-        }
-        throw err2;
+        batchVectors = await tryProvider(
+          "Jina embed",
+          () => jinaEmbed(batch),
+          PROVIDER_RETRIES
+        );
+        providerUsed = config.jinaEmbeddingModel;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`Jina embed failed, trying OpenAI: ${msg.slice(0, 160)}`);
       }
     }
-    const embeddings = res.embeddings ?? [];
-    if (embeddings.length !== batch.length) {
-      throw new Error(
-        `embedding API returned ${embeddings.length} vectors for ${batch.length} inputs`
-      );
+
+    // --- Tier 2: OpenAI (fallback) ---
+    if (!batchVectors && config.openaiApiKey) {
+      try {
+        batchVectors = await tryProvider(
+          "OpenAI embed",
+          () => openaiEmbed(batch),
+          PROVIDER_RETRIES
+        );
+        providerUsed = config.openaiEmbeddingModel;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`OpenAI embed failed, trying Gemini: ${msg.slice(0, 160)}`);
+      }
     }
-    await db
-      .insert(qbAiUsage)
-      .values({ model: config.embeddingModel, kind: "embed", tokens: null });
-    for (const e of embeddings) {
-      vectors.push(l2Normalize(e.values ?? []));
+
+    // --- Tier 3: Gemini (emergency fallback) ---
+    if (!batchVectors) {
+      try {
+        batchVectors = await tryProvider(
+          "Gemini embed",
+          () => geminiEmbed(batch),
+          PROVIDER_RETRIES
+        );
+        providerUsed = config.embeddingModel;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `All embedding providers failed for batch: ${msg.slice(0, 200)}`
+        );
+      }
+    }
+
+    // Ledger entry — one row per API batch (not per text).
+    if (providerUsed) {
+      await db
+        .insert(qbAiUsage)
+        .values({ model: providerUsed, kind: "embed", tokens: null });
+    }
+
+    // All providers return normalized vectors, but re-normalizing is
+    // idempotent — safe to always call for consistency.
+    for (const vec of batchVectors!) {
+      vectors.push(l2Normalize(vec));
     }
   }
+
   return vectors;
 }
 
@@ -239,6 +371,8 @@ export async function judgePairs(
 // Layer 2: score one pair in an independent embedding space. Deterministic;
 // null only on API failure. Nothing is stored — the bank stays in the
 // primary model's space (the two spaces are incompatible).
+// Uses Gemini embedding-2 as the independent space (low volume, stays
+// within free tier limits since it's only called when judge fails).
 export async function secondOpinionSame(
   a: string,
   b: string
@@ -278,4 +412,3 @@ export async function secondOpinionSame(
     return null;
   }
 }
-
