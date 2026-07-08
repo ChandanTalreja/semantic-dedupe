@@ -47,11 +47,12 @@ export const config = {
     return num("EMBEDDING_DIMS", 768);
   },
 
-  // Judge chain, tried in order (retry once per model). Gemma free tier
-  // throws intermittent 500s — two models give two independent chances.
-  // Ids verified against ListModels 2026-07.
+  // Judge model — Gemini 3.1 Flash Lite. Proven reliable in TUBEBOX
+  // (same API key, 15 RPM / 250K TPM / 500 RPD on free tier).
+  // Gemma models were deprecated due to chronic 500s and timeouts.
+  // Override via JUDGE_MODELS env (comma-separated for chaining).
   get judgeModels(): string[] {
-    return (process.env.JUDGE_MODELS ?? "gemma-4-31b-it,gemma-4-26b-a4b-it")
+    return (process.env.JUDGE_MODELS ?? "gemini-3.1-flash-lite")
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
@@ -67,14 +68,14 @@ export const config = {
     return num("SECOND_OPINION_THRESHOLD", 0.9);
   },
 
-  // Judge fail-fast: cap each attempt so a congested Gemma can't stall a
+  // Judge fail-fast: cap each attempt so a congested model can't stall a
   // run — on timeout we drop to the deterministic second-opinion tiebreak.
   get judgeTimeoutMs() {
     return num("JUDGE_TIMEOUT_MS", 25000);
   },
 
   // cosine >= match → duplicate (variant); < review → new canonical;
-  // in between → Gemma judge decides.
+  // in between → judge decides.
   get matchThreshold() {
     return num("MATCH_THRESHOLD", 0.92);
   },
