@@ -8,15 +8,45 @@ function num(name: string, fallback: number): number {
 }
 
 export const config = {
+  // ---------------------------------------------------------------------------
+  // Embedding providers — tiered fallback: Jina (primary) → OpenAI → Gemini.
+  // Jina's free tier is 2,000 RPM / 10M tokens with no card required.
+  // OpenAI requires a payment method on file for any API access.
+  // Gemini remains as the emergency fallback and powers judge/second-opinion.
+  // ---------------------------------------------------------------------------
+
+  get jinaApiKey() {
+    return process.env.JINA_API_KEY;
+  },
+  get jinaBaseUrl() {
+    return process.env.JINA_BASE_URL ?? "https://api.jina.ai/v1";
+  },
+  get jinaEmbeddingModel() {
+    return process.env.JINA_EMBEDDING_MODEL ?? "jina-embeddings-v3";
+  },
+
+  get openaiApiKey() {
+    return process.env.OPENAI_API_KEY;
+  },
+  get openaiEmbeddingModel() {
+    return process.env.OPENAI_EMBEDDING_MODEL ?? "text-embedding-3-small";
+  },
+
+  // Legacy Gemini embedding model — still used for emergency fallback and
+  // second-opinion embeddings (independent space from the bank).
   get embeddingModel() {
     return process.env.EMBEDDING_MODEL ?? "gemini-embedding-001";
   },
+
   // Baked into the qb_questions DDL on first init — changing it later
   // requires dropping/recreating the table (embeddings are not comparable
   // across dimensionalities anyway).
+  // Both Jina (jina-embeddings-v3) and OpenAI (with truncation) output 768
+  // dims, so the bank stays compatible across the fallback chain.
   get embeddingDims() {
     return num("EMBEDDING_DIMS", 768);
   },
+
   // Judge chain, tried in order (retry once per model). Gemma free tier
   // throws intermittent 500s — two models give two independent chances.
   // Ids verified against ListModels 2026-07.
@@ -26,6 +56,7 @@ export const config = {
       .map((s) => s.trim())
       .filter(Boolean);
   },
+
   // Second-opinion embedding space (independent from the bank's model) used
   // when every judge model is down: deterministic tiebreak for gray-zone
   // pairs. Never stored — the bank stays in embeddingModel's space.
@@ -35,11 +66,13 @@ export const config = {
   get secondOpinionThreshold() {
     return num("SECOND_OPINION_THRESHOLD", 0.9);
   },
+
   // Judge fail-fast: cap each attempt so a congested Gemma can't stall a
   // run — on timeout we drop to the deterministic second-opinion tiebreak.
   get judgeTimeoutMs() {
     return num("JUDGE_TIMEOUT_MS", 25000);
   },
+
   // cosine >= match → duplicate (variant); < review → new canonical;
   // in between → Gemma judge decides.
   get matchThreshold() {
@@ -48,19 +81,25 @@ export const config = {
   get reviewThreshold() {
     return num("REVIEW_THRESHOLD", 0.8);
   },
+
   get maxUploadFiles() {
     return num("MAX_UPLOAD_FILES", 5);
   },
+
   // Videos per /api/sync request. Each chunk COMMITS before the next, so a
-  // mid-run failure or the daily embedding cap can't wipe the whole run —
-  // you keep every chunk that finished. Small keeps the loss window small.
+  // mid-run failure or the daily embedding cap can't wipe the whole run.
+  // Raised from 3 → 25 now that the embedding bottleneck (Google's 100
+  // texts/min) is removed. Jina/OpenAI both comfortably handle 25 videos
+  // worth of questions in a single batch (up to 1,024 texts per request).
   get syncBatchSize() {
-    return num("SYNC_BATCH_SIZE", 3);
+    return num("SYNC_BATCH_SIZE", 25);
   },
+
   // App-level safety net across ALL AI calls (embed/judge/extract) per UTC day.
   get aiDailyLimit() {
     return num("AI_DAILY_LIMIT", 1000);
   },
+
   // Fixed section taxonomy (option c): the ONLY headings the master list can
   // use. Each canonical question is filed under the label whose description
   // its embedding is closest to — deterministic, no LLM, always consistent.
