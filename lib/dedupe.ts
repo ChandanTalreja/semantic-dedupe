@@ -270,7 +270,7 @@ export async function processSources(
     if (hit && hit.sim >= config.matchThreshold) {
       textRef.set(g.text, refOf(hit.entry));
     } else {
-      textRef.set(text, createCanonical(g.text, g.vec));
+      textRef.set(g.text, createCanonical(g.text, g.vec));
     }
   }
 
